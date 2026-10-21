@@ -1,6 +1,6 @@
 # Én vare per linje. Vær gjerne litt spesifikk («Evergood kaffe» gir bedre treff enn «kaffe»).
 # Linjer som starter med # blir ignorert.
-kaffe (lager) #lager betyr at det kommer hamstrings tips i appen 
+kaffe (lager) 
 kyllingfilet
 norvegia (lager)
 grandiosa
@@ -11,5 +11,5 @@ laks
 avokado
 kjøttdeig
 karbonadedeig
-brød -knekkebrød #gjør at knekkebrød ikke kommer med i søket brød
+brød -knekkebrød 
 ost

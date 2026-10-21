@@ -1,0 +1,6 @@
+# Én vare per linje. Vær gjerne litt spesifikk («Evergood kaffe» gir bedre treff enn «kaffe»).
+# Linjer som starter med # blir ignorert.
+kaffe
+kyllingfilet
+norvegia
+grandiosa

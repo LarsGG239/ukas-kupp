@@ -1,0 +1,12 @@
+# Kjedene som tas med (én per linje, deler av navnet holder).
+# Fjern eller legg til etter hvor du handler.
+Kiwi
+Rema 1000
+Extra
+Prix
+Mega
+Obs
+Meny
+Spar
+Joker
+Bunnpris

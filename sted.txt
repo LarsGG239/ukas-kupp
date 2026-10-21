@@ -1,0 +1,4 @@
+# Hvor butikkene dine ligger: breddegrad, lengdegrad, radius i km.
+# Finn koordinater ved å holde fingeren på et sted i Google Maps.
+# Standard: Trondheim sentrum, 8 km.
+63.4305, 10.3951, 8

@@ -384,6 +384,50 @@ def evaluate(product, history):
     }
 
 
+# ---------- tydelig vurdering ----------
+# Mange avistilbud har ingen førpris. Da sammenligner vi kiloprisen med det som er
+# vanlig for den samme varen i avisene: ukas andre tilbud pluss tidligere uker.
+UNIT_WORD = {"kg": "kilo", "l": "liter", "stk": "stykk"}
+HIST_WEEKS = 12
+
+
+def verdict_from(score):
+    if score is None:
+        return "ukjent"
+    if score >= KUPP:
+        return "kupp"
+    if score >= GREI:
+        return "bra"
+    if score >= -0.05:
+        return "vanlig"
+    return "dyr"
+
+
+def judge_item(item, offers, history, week_key):
+    units = [o["unit"] for o in offers if o["unit_price"]]
+    main = max(set(units), key=units.count) if units else None
+    this = [o["unit_price"] for o in offers if o["unit_price"] and o["unit"] == main]
+    key = "item:" + split_item(item)[0]
+    past_rows = [r for r in history.get(key, []) if r[0] != week_key and r[1] == main]
+    past = [p for r in past_rows for p in r[2]]
+    pool = past + this
+    ref = statistics.median(pool) if len(pool) >= 4 else None
+    for o in offers:
+        o["ref_unit"], o["ref_has_past"], o["ref_n"] = ref, len(past) >= 4, len(this)
+        ud = (1 - o["unit_price"] / ref) if ref and o["unit_price"] and o["unit"] == main else None
+        o["unit_disc"] = ud
+        fd = o["discount"] if o["source"] == "avis" else None
+        if fd is not None and fd >= GREI and ud is not None and ud < 0:
+            o["verdict"] = "pynt"
+        else:
+            o["verdict"] = verdict_from(ud if ud is not None else fd)
+    if main and this:
+        rows = [r for r in history.get(key, []) if r[0] != week_key]
+        rows.append([week_key, main, [round(p, 2) for p in this]])
+        history[key] = rows[-HIST_WEEKS:]
+    return offers
+
+
 # ---------- HTML ----------
 def kr(p):
     if p is None:
@@ -402,19 +446,45 @@ def short_date(d):
     return f"{DAYS[d.weekday()]} {d.day}.{d.month}"
 
 
+BADGES = {
+    "kupp": ("v-kupp", "Kupp"),
+    "bra": ("v-bra", "Bra pris"),
+    "grei": ("v-bra", "Bra pris"),
+    "vanlig": ("v-vanlig", "Vanlig pris"),
+    "dyr": ("v-dyr", "Dyrere enn vanlig"),
+    "pynt": ("v-pynt", "Pynt-tilbud"),
+    "ukjent": ("v-vanlig", "For lite data"),
+    "avis": ("v-vanlig", "For lite data"),
+}
+
+
+def explain(o):
+    parts = []
+    ud, ref = o.get("unit_disc"), o.get("ref_unit")
+    if ud is not None and ref:
+        word = UNIT_WORD.get(o["unit"], "")
+        pct = abs(round(ud * 100))
+        side = "under" if ud >= 0 else "over"
+        if o.get("ref_has_past"):
+            parts.append(f"{pct} % {side} vanlig {word}pris i avisene ({kr(ref)}/{o['unit']})")
+        else:
+            parts.append(f"{pct} % {side} midten av ukas {o.get('ref_n', 0)} tilbud ({kr(ref)}/{o['unit']})")
+    if o["verdict"] == "pynt":
+        parts.append("har førpris, men kiloprisen er ikke lav")
+    elif o["discount"] is not None and o["typical"]:
+        ref_word = "førpris" if o["source"] == "avis" else "vanlig pris"
+        parts.append(f"{round(o['discount'] * 100)} % under {ref_word} {kr(o['typical'])}")
+    if not parts and o["source"] == "avis":
+        parts.append("ingen førpris og for få like tilbud å sammenligne med")
+    text = "; ".join(parts)
+    return text[:1].upper() + text[1:]
+
+
 def offer_html(o, small=False):
     e = html.escape
-    badge = {"kupp": '<span class="v v-kupp">Kupp</span>',
-             "grei": '<span class="v v-grei">Grei pris</span>',
-             "avis": '<span class="v v-avis">Avistilbud</span>'}.get(o["verdict"], "")
-    if o["discount"] is not None and o["typical"]:
-        ref = "førpris" if o["source"] == "avis" else "vanlig pris"
-        per = f"/{o['typical_unit']}" if o.get("typical_unit") else ""
-        why = f"{round(o['discount'] * 100)} % under {ref} ({kr(o['typical'])}{per})"
-    elif o["source"] == "avis":
-        why = "Kjeden oppgir ingen førpris"
-    else:
-        why = ""
+    cls, label = BADGES.get(o["verdict"], ("v-vanlig", ""))
+    badge = f'<span class="v {cls}">{label}</span>' if label else ""
+    why = explain(o)
     unit = f"<small>{kr(o['unit_price'])}/{o['unit']}</small>" if o["unit_price"] else ""
     name = e(o["name"])
     if o["url"]:
@@ -425,14 +495,14 @@ def offer_html(o, small=False):
     if o["till"]:
         meta.append(f"til {short_date(o['till'])}")
     img = f'<img class="pic" src="{e(o["image"])}" alt="" loading="lazy" referrerpolicy="no-referrer">' if o.get("image") else ""
-    return (f'<div class="offer{" small" if small else ""}"><div class="price"><b>{kr(o["price"])}</b>{unit}</div>'
+    return (f'<div class="offer{" small" if small else ""} o-{o["verdict"]}"><div class="price"><b>{kr(o["price"])}</b>{unit}</div>'
             f'<div class="info">{img}<p class="prod">{name}</p><p class="meta">{", ".join(meta)}</p>'
             f'<p class="why">{badge}{e(why)}</p></div></div>')
 
 
 CSS = """
-:root{--bg:#F3F5F1;--surface:#fff;--ink:#17201C;--muted:#5D6863;--line:#D7DDD6;--tag:#FFD23F;--tag-ink:#1A1A10;--red:#C8102E;--chip:#E6EBE4;color-scheme:light}
-@media (prefers-color-scheme:dark){:root{--bg:#111614;--surface:#1A211E;--ink:#E8EDE9;--muted:#9AA6A0;--line:#2B3430;--red:#FF5C70;--chip:#242D29;color-scheme:dark}}
+:root{--bg:#F3F5F1;--surface:#fff;--ink:#17201C;--muted:#5D6863;--line:#D7DDD6;--tag:#FFD23F;--tag-ink:#1A1A10;--red:#C8102E;--chip:#E6EBE4;--good:#1E7B4A;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#111614;--surface:#1A211E;--ink:#E8EDE9;--muted:#9AA6A0;--line:#2B3430;--red:#FF5C70;--chip:#242D29;--good:#3FB37A;color-scheme:dark}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:"Archivo",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.45}
 main{max-width:680px;margin:0 auto;padding:max(20px,env(safe-area-inset-top)) 18px 64px}
 .hero{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:12px 0 18px}
@@ -450,7 +520,12 @@ h2{font-stretch:75%;font-weight:800;font-size:1.4rem;margin:0 0 10px}
 .small .pic{width:56px;height:56px}.prod{font-weight:700;margin:0;overflow-wrap:anywhere}.prod a{color:inherit}
 .meta{color:var(--muted);font-size:.88rem;margin:2px 0 0}.why{font-size:.9rem;margin:6px 0 0}
 .v{display:inline-block;font-size:.78rem;font-weight:800;padding:2px 8px;border-radius:3px;margin-right:6px}
-.v-kupp{background:var(--red);color:#fff}.v-grei{background:var(--chip);color:var(--ink)}.v-avis{background:transparent;color:var(--ink);border:1px solid var(--line)}
+.v-kupp{background:var(--red);color:#fff}.v-bra{background:var(--good);color:#fff}
+.v-vanlig{background:transparent;color:var(--muted);border:1px solid var(--line)}
+.v-dyr,.v-pynt{background:transparent;color:var(--red);border:1px solid var(--red)}
+.o-kupp{border-color:var(--red);border-width:2px}.o-vanlig,.o-dyr,.o-pynt,.o-ukjent,.o-avis{opacity:.72}
+.o-vanlig .price,.o-dyr .price,.o-pynt .price,.o-ukjent .price,.o-avis .price{background:var(--chip);color:var(--ink)}
+.sum{font-weight:700;margin:0 0 10px}.sum-kupp{color:var(--red)}.sum-bra{color:var(--good)}.sum-ingen{color:var(--muted)}
 h3{font-size:.95rem;font-weight:700;color:var(--muted);margin:12px 0 6px}
 .cheap{color:var(--muted);font-size:.9rem;margin:4px 2px 12px}.none{color:var(--muted)}
 footer{color:var(--muted);font-size:.85rem;margin-top:28px}footer a{color:inherit}
@@ -458,21 +533,22 @@ footer{color:var(--muted);font-size:.85rem;margin-top:28px}footer a{color:inheri
 
 
 def sort_key(o):
-    rank = {"kupp": 0, "grei": 1, "avis": 2}.get(o["verdict"], 3)
-    return (rank, -(o["discount"] or 0), o["unit_price"] if o["unit_price"] else o["price"])
+    rank = {"kupp": 0, "bra": 1, "grei": 1, "vanlig": 2, "ukjent": 3, "avis": 3, "pynt": 4, "dyr": 5}.get(o["verdict"], 3)
+    score = o.get("unit_disc") if o.get("unit_disc") is not None else (o["discount"] or 0)
+    return (rank, -score, o["unit_price"] if o["unit_price"] else o["price"])
 
 
 def build_html(results, week, errors, sources, top_deals):
     e = html.escape
     n_avis = sum(1 for r in results.values() if r["avis"])
-    n_kupp = sum(1 for r in results.values() for o in r["avis"] + r["deals"] if o["verdict"] == "kupp")
+    n_kupp = sum(1 for r in results.values() if any(o["verdict"] == "kupp" for o in r["avis"] + r["deals"]))
     tally = {}
     for r in results.values():
         best = (r["avis"] or r["deals"] or [None])[0]
         if best:
             tally[best["store"]] = tally.get(best["store"], 0) + 1
     lead = f"{n_avis} av {len(results)} varer er på tilbud i avisene"
-    lead += f", {n_kupp} av tilbudene er kupp." if n_kupp else "."
+    lead += f", og {n_kupp} av dem har et ekte kupp." if n_kupp else ", men ingen ekte kupp."
     if tally:
         top = max(tally.items(), key=lambda kv: kv[1])
         if top[1] > 1:
@@ -481,6 +557,13 @@ def build_html(results, week, errors, sources, top_deals):
     parts = []
     for item, r in results.items():
         parts.append(f"<section><h2>{e(split_item(item)[0])}</h2>")
+        best = (r["avis"] or r["deals"] or [None])[0]
+        if best and best["verdict"] == "kupp":
+            parts.append(f'<p class="sum sum-kupp">Kjøp nå: kupp hos {e(best["store"])}.</p>')
+        elif best and best["verdict"] in ("bra", "grei"):
+            parts.append(f'<p class="sum sum-bra">Bra pris hos {e(best["store"])}, men ikke et kupp.</p>')
+        elif best:
+            parts.append('<p class="sum sum-ingen">Ingen gode tilbud denne uka. Vent gjerne.</p>')
         if r["avis"]:
             parts.append("<h3>I tilbudsavisene</h3>")
             parts.append(offer_html(r["avis"][0]))
@@ -497,7 +580,7 @@ def build_html(results, week, errors, sources, top_deals):
                          f'{e(c["store"])}, {kr(c["price"])}{per}</p>')
         parts.append("</section>")
     if top_deals:
-        parts.append('<section><h2>Ukas største kupp</h2><p class="cheap">Uansett handleliste, sortert etter rabatt mot førpris.</p>')
+        parts.append('<section><h2>Største rabatter mot førpris</h2><p class="cheap">Uansett handleliste. Førprisen er kjedens egen, så sjekk kiloprisen.</p>')
         parts.extend(offer_html(o, small=True) for o in top_deals)
         parts.append("</section>")
     if errors:
@@ -531,6 +614,8 @@ def main():
     errors, sources = [], []
     results = {it: {"avis": [], "deals": [], "cheapest": None} for it in items}
     top_deals = []
+    iso = NOW.isocalendar()
+    week_key = f"{iso[0]}-W{iso[1]:02d}"
 
     # 1) Tilbudsavisene fra Tjek
     geo = read_place()
@@ -546,10 +631,11 @@ def main():
                         found.setdefault(o["id"], o)
             except Exception as ex:
                 print(f"  søk feilet for {item}: {ex}")
-            results[item]["avis"] = sorted(found.values(), key=sort_key)[:MAX_AVIS]
+            judged = judge_item(item, list(found.values()), history, week_key)
+            results[item]["avis"] = sorted(judged, key=sort_key)[:MAX_AVIS]
             print(f"  {item}: {len(found)} avistilbud")
         seen = set()
-        for o in sorted((o for o in all_avis if o["verdict"] == "kupp"), key=lambda o: -o["discount"]):
+        for o in sorted((o for o in all_avis if o["verdict"] == "kupp" and o["discount"] is not None), key=lambda o: -o["discount"]):
             k = (o["store"], o["name"].lower(), o["price"])
             if k not in seen:
                 seen.add(k)

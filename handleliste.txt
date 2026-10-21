@@ -4,11 +4,12 @@ kaffe
 kyllingfilet
 norvegia
 grandiosa
-Parmesan 
-Puldpork 
+parmesan 
+pulled pork
 sjokoladeplate 
 laks
 avokado
 kjøttdeig
 karbonadedeig
-brød
+brød -knekkebrød
+ost

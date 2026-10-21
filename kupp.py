@@ -184,7 +184,33 @@ def unit_from_text(text):
     return None, None
 
 
+def pick_image(o):
+    """Finn en bilde-URL uansett hvordan Tjek pakker den inn."""
+    for key in ("images", "image", "image_url"):
+        v = o.get(key)
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+        if isinstance(v, list):
+            v = v[0] if v else None
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        if isinstance(v, dict):
+            for k in ("view", "zoom", "thumb", "url", "original"):
+                u = v.get(k)
+                if isinstance(u, str) and u.startswith("http"):
+                    return u
+    return None
+
+
+DEBUG_SHOWN = False
+
+
 def norm_tjek(o, store_by_catalog):
+    global DEBUG_SHOWN
+    if not DEBUG_SHOWN:
+        DEBUG_SHOWN = True
+        print("Tjek-eksempel, felter:", sorted(o.keys()))
+        print("Tjek-eksempel, bilde:", json.dumps(o.get("images") or o.get("image"), ensure_ascii=False)[:300])
     pricing = o.get("pricing") or {}
     price = pricing.get("price")
     if price is None:
@@ -232,7 +258,7 @@ def norm_tjek(o, store_by_catalog):
         "unit_price": unit_price,
         "unit": unit or "stk",
         "url": None,
-        "image": (o.get("images") or {}).get("view") or (o.get("images") or {}).get("thumb"),
+        "image": pick_image(o),
         "from": start,
         "till": till,
         "source": "avis",

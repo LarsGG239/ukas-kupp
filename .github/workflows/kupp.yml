@@ -1,0 +1,39 @@
+name: Ukas kupp
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+    - cron: "0 5 * * 4"
+  workflow_dispatch:
+  push:
+    paths:
+      - handleliste.txt
+      - butikker.txt
+      - sted.txt
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ukas-kupp
+  cancel-in-progress: false
+
+jobs:
+  kupp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Hent priser og lag siden
+        run: python kupp.py
+        env:
+          KASSALAPP_API_KEY: ${{ secrets.KASSALAPP_API_KEY }}
+      - name: Lagre resultat
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs data
+          git diff --cached --quiet || git commit -m "Ukas kupp $(date +%G-W%V)"
+          git push

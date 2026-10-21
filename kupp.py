@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -308,10 +308,15 @@ def tjek_search(geo, term, store_by_catalog, store_filter):
 
 def split_item(line):
     """«brød -knekkebrød -mix» -> visningsnavn «brød», søkeord og ord som utelukker."""
-    words = line.lower().split()
+    words = [w for w in line.lower().split() if w != "(lager)"]
     plus = [w for w in words if not w.startswith("-")]
     minus = [w[1:] for w in words if w.startswith("-") and len(w) > 1]
     return " ".join(plus) or line, plus, minus
+
+
+def is_storable(line):
+    """Varer merket «(lager)» tåler å kjøpes inn på bunnpris."""
+    return "(lager)" in line.lower()
 
 
 def matches(item, name):
@@ -403,7 +408,82 @@ def verdict_from(score):
     return "dyr"
 
 
-def judge_item(item, offers, history, week_key):
+# ---------- hyllepris (Kassalapp) ----------
+STOP = {"med", "uten", "stor", "liten", "pakke", "frossen", "fersk", "norsk"}
+LOW_WINDOW = 84  # «laveste på 12 uker»
+
+
+def tokens(name):
+    return {w for w in re.findall(r"[a-zæøå]+", (name or "").lower()) if len(w) >= 4 and w not in STOP}
+
+
+def shelf_entry(p):
+    """Vanlig hyllepris og laveste pris siste 12 uker, regnet om til kilo-/literpris."""
+    cur, cu = p.get("current_price"), p.get("current_unit_price")
+    if not cur or not cu:
+        return None
+    updated = parse_date(p.get("updated_at"))
+    if updated and updated < NOW - timedelta(days=STALE_DAYS):
+        return None
+    factor = cu / cur
+    typ = typical_price(p, [])
+    cutoff = NOW - timedelta(days=LOW_WINDOW)
+    window = [float(h["price"]) for h in p.get("price_history") or []
+              if h.get("price") and (parse_date(h.get("date")) or NOW) >= cutoff]
+    return {
+        "name": p.get("name") or "",
+        "store": ((p.get("store") or {}).get("name") or "").lower(),
+        "unit": unit_label(p),
+        "typical_unit": typ * factor if typ else None,
+        "low_unit": min(window + [float(cur)]) * factor if window else None,
+        "tokens": tokens(p.get("name")),
+    }
+
+
+def match_shelf(o, shelf, item):
+    """Finn hylleprisen for samme produkt (merke) i Kassalapp, ellers vanlig hyllepris for varen."""
+    if not o["unit_price"] or not shelf:
+        return None
+    base = set(split_item(item)[1])
+    cands = [s for s in shelf if s["unit"] == o["unit"] and s["typical_unit"]]
+    if not cands:
+        return None
+    own = tokens(o["name"]) - base
+    best, best_score = None, 0
+    chain = o["store"].lower().split()[0] if o["store"] else ""
+    for c in cands:
+        score = len(own & (c["tokens"] - base))
+        if score and chain and chain in c["store"]:
+            score += 0.5
+        if score > best_score:
+            best, best_score = c, score
+    if best:
+        return best["typical_unit"], best["low_unit"], f"vanlig hyllepris for {best['name']}"
+    if len(cands) >= 3:
+        return statistics.median(c["typical_unit"] for c in cands), None, f"vanlig hyllepris for {split_item(item)[0]}"
+    return None
+
+
+def week_date(key):
+    y, w = key.split("-W")
+    return date.fromisocalendar(int(y), int(w), 1)
+
+
+def cycle_info(rows, unit, week_key):
+    """Hvor ofte varen pleier å være på kupp, ut fra laveste avispris uke for uke."""
+    pts = sorted((week_date(r[0]), min(r[2])) for r in rows if r[1] == unit and r[2])
+    if len(pts) < 4:
+        return None
+    ref = statistics.median(m for _, m in pts)
+    dips = [d for d, m in pts if m <= ref * 0.85]
+    if len(dips) < 2:
+        return {"weeks": len(pts)}
+    gaps = [(b - a).days / 7 for a, b in zip(dips, dips[1:])]
+    return {"weeks": len(pts), "gap": max(1, round(sum(gaps) / len(gaps))),
+            "since": round((week_date(week_key) - dips[-1]).days / 7)}
+
+
+def judge_item(item, offers, history, week_key, shelf=None):
     units = [o["unit"] for o in offers if o["unit_price"]]
     main = max(set(units), key=units.count) if units else None
     this = [o["unit_price"] for o in offers if o["unit_price"] and o["unit"] == main]
@@ -412,20 +492,42 @@ def judge_item(item, offers, history, week_key):
     past = [p for r in past_rows for p in r[2]]
     pool = past + this
     ref = statistics.median(pool) if len(pool) >= 4 else None
+    past_mins = [(week_date(r[0]), min(r[2])) for r in past_rows if r[2]]
     for o in offers:
         o["ref_unit"], o["ref_has_past"], o["ref_n"] = ref, len(past) >= 4, len(this)
         ud = (1 - o["unit_price"] / ref) if ref and o["unit_price"] and o["unit"] == main else None
         o["unit_disc"] = ud
+        sm = match_shelf(o, shelf, item)
+        sd = None
+        if sm:
+            o["shelf_ref"], o["shelf_low"], o["shelf_label"] = sm
+            sd = 1 - o["unit_price"] / o["shelf_ref"]
+        o["shelf_disc"] = sd
         fd = o["discount"] if o["source"] == "avis" else None
-        if fd is not None and fd >= GREI and ud is not None and ud < 0:
+        main_score = sd if sd is not None else ud
+        o["score"] = main_score if main_score is not None else fd
+        if fd is not None and fd >= GREI and main_score is not None and main_score < 0:
             o["verdict"] = "pynt"
         else:
-            o["verdict"] = verdict_from(ud if ud is not None else fd)
+            o["verdict"] = verdict_from(o["score"])
+        # Laveste på 12 uker: fra Kassalapps prishistorikk eller egen avishistorikk.
+        # Egen avishistorikk veier tyngst. Kassalapp brukes bare når den faktisk har
+        # registrert prisdupper, ellers ville alle tilbud sett ut som bunnpris.
+        low = 0
+        if len(past_mins) >= 3 and o["unit"] == main:
+            mins = [m for _, m in past_mins]
+            if o["unit_price"] <= min(mins) and o["unit_price"] < statistics.median(mins) * 0.95:
+                low = (week_date(week_key) - min(d for d, _ in past_mins)).days // 7 + 1
+        elif sm and o.get("shelf_low") and o["shelf_low"] < o["shelf_ref"] * 0.95 \
+                and o["unit_price"] <= o["shelf_low"] * 1.001:
+            low = LOW_WINDOW // 7
+        o["low_weeks"] = low
     if main and this:
         rows = [r for r in history.get(key, []) if r[0] != week_key]
         rows.append([week_key, main, [round(p, 2) for p in this]])
         history[key] = rows[-HIST_WEEKS:]
-    return offers
+    info = cycle_info(history.get(key, []), main, week_key) if main else None
+    return offers, info
 
 
 # ---------- HTML ----------
@@ -461,7 +563,11 @@ BADGES = {
 def explain(o):
     parts = []
     ud, ref = o.get("unit_disc"), o.get("ref_unit")
-    if ud is not None and ref:
+    if o.get("shelf_disc") is not None:
+        sd = o["shelf_disc"]
+        side = "under" if sd >= 0 else "over"
+        parts.append(f"{abs(round(sd * 100))} % {side} {o['shelf_label']} ({kr(o['shelf_ref'])}/{o['unit']})")
+    elif ud is not None and ref:
         word = UNIT_WORD.get(o["unit"], "")
         pct = abs(round(ud * 100))
         side = "under" if ud >= 0 else "over"
@@ -484,6 +590,9 @@ def offer_html(o, small=False):
     e = html.escape
     cls, label = BADGES.get(o["verdict"], ("v-vanlig", ""))
     badge = f'<span class="v {cls}">{label}</span>' if label else ""
+    if o.get("low_weeks"):
+        badge += f'<span class="v v-low">Laveste på {o["low_weeks"]} uker</span>'
+
     why = explain(o)
     unit = f"<small>{kr(o['unit_price'])}/{o['unit']}</small>" if o["unit_price"] else ""
     name = e(o["name"])
@@ -525,6 +634,7 @@ h2{font-stretch:75%;font-weight:800;font-size:1.4rem;margin:0 0 10px}
 .v-dyr,.v-pynt{background:transparent;color:var(--red);border:1px solid var(--red)}
 .o-kupp{border-color:var(--red);border-width:2px}.o-vanlig,.o-dyr,.o-pynt,.o-ukjent,.o-avis{opacity:.72}
 .o-vanlig .price,.o-dyr .price,.o-pynt .price,.o-ukjent .price,.o-avis .price{background:var(--chip);color:var(--ink)}
+.v-low{background:var(--tag);color:var(--tag-ink)}
 .sum{font-weight:700;margin:0 0 10px}.sum-kupp{color:var(--red)}.sum-bra{color:var(--good)}.sum-ingen{color:var(--muted)}
 h3{font-size:.95rem;font-weight:700;color:var(--muted);margin:12px 0 6px}
 .cheap{color:var(--muted);font-size:.9rem;margin:4px 2px 12px}.none{color:var(--muted)}
@@ -534,8 +644,32 @@ footer{color:var(--muted);font-size:.85rem;margin-top:28px}footer a{color:inheri
 
 def sort_key(o):
     rank = {"kupp": 0, "bra": 1, "grei": 1, "vanlig": 2, "ukjent": 3, "avis": 3, "pynt": 4, "dyr": 5}.get(o["verdict"], 3)
-    score = o.get("unit_disc") if o.get("unit_disc") is not None else (o["discount"] or 0)
+    score = o.get("score")
+    if score is None:
+        score = o.get("unit_disc") if o.get("unit_disc") is not None else (o["discount"] or 0)
     return (rank, -score, o["unit_price"] if o["unit_price"] else o["price"])
+
+
+def advice_html(item, best, cycle):
+    e = html.escape
+    lager = is_storable(item)
+    gap = (cycle or {}).get("gap")
+    low = f" Laveste pris på {best['low_weeks']} uker." if best and best.get("low_weeks") else ""
+    if best and best["verdict"] == "kupp":
+        if lager:
+            weeks = gap or 4
+            return (f'<p class="sum sum-kupp">Bunnpris hos {e(best["store"])}: kjøp nok til ca. {weeks} uker.{low}</p>')
+        return f'<p class="sum sum-kupp">Kjøp nå: kupp hos {e(best["store"])}.{low}</p>'
+    if lager and gap:
+        wait = max(0, gap - (cycle.get("since") or 0))
+        when = f"neste ventes om ca. {wait} uke{'r' if wait != 1 else ''}" if wait else "neste kan komme når som helst"
+        return f'<p class="sum sum-ingen">Vent: pleier å være på kupp ca. hver {gap}. uke, {when}.</p>'
+    if best and best["verdict"] in ("bra", "grei"):
+        return f'<p class="sum sum-bra">Bra pris hos {e(best["store"])}, men ikke et kupp.{low}</p>'
+    if best:
+        tail = " Kjøp bare det du trenger nå." if lager else " Vent gjerne."
+        return f'<p class="sum sum-ingen">Ingen gode tilbud denne uka.{tail}</p>'
+    return ""
 
 
 def build_html(results, week, errors, sources, top_deals):
@@ -558,12 +692,9 @@ def build_html(results, week, errors, sources, top_deals):
     for item, r in results.items():
         parts.append(f"<section><h2>{e(split_item(item)[0])}</h2>")
         best = (r["avis"] or r["deals"] or [None])[0]
-        if best and best["verdict"] == "kupp":
-            parts.append(f'<p class="sum sum-kupp">Kjøp nå: kupp hos {e(best["store"])}.</p>')
-        elif best and best["verdict"] in ("bra", "grei"):
-            parts.append(f'<p class="sum sum-bra">Bra pris hos {e(best["store"])}, men ikke et kupp.</p>')
-        elif best:
-            parts.append('<p class="sum sum-ingen">Ingen gode tilbud denne uka. Vent gjerne.</p>')
+        advice = advice_html(item, best, r.get("cycle"))
+        if advice:
+            parts.append(advice)
         if r["avis"]:
             parts.append("<h3>I tilbudsavisene</h3>")
             parts.append(offer_html(r["avis"][0]))
@@ -612,42 +743,14 @@ def main():
     key = os.environ.get("KASSALAPP_API_KEY")
     history = json.loads(HIST_FILE.read_text(encoding="utf-8")) if HIST_FILE.exists() else {}
     errors, sources = [], []
-    results = {it: {"avis": [], "deals": [], "cheapest": None} for it in items}
+    results = {it: {"avis": [], "deals": [], "cheapest": None, "cycle": None} for it in items}
     top_deals = []
     iso = NOW.isocalendar()
     week_key = f"{iso[0]}-W{iso[1]:02d}"
 
-    # 1) Tilbudsavisene fra Tjek
-    geo = read_place()
-    try:
-        all_avis, store_by_catalog = tjek_all_offers(geo, store_filter)
-        print(f"Tjek: {len(all_avis)} tilbud totalt")
-        for item in items:
-            found = {o["id"]: o for o in all_avis if matches(item, o["name"])}
-            time.sleep(TJEK_PAUSE)
-            try:
-                for o in tjek_search(geo, split_item(item)[0], store_by_catalog, store_filter):
-                    if matches(item, o["name"]):
-                        found.setdefault(o["id"], o)
-            except Exception as ex:
-                print(f"  søk feilet for {item}: {ex}")
-            judged = judge_item(item, list(found.values()), history, week_key)
-            results[item]["avis"] = sorted(judged, key=sort_key)[:MAX_AVIS]
-            print(f"  {item}: {len(found)} avistilbud")
-        seen = set()
-        for o in sorted((o for o in all_avis if o["verdict"] == "kupp" and o["discount"] is not None), key=lambda o: -o["discount"]):
-            k = (o["store"], o["name"].lower(), o["price"])
-            if k not in seen:
-                seen.add(k)
-                top_deals.append(o)
-        top_deals = top_deals[:TOP_DEALS]
-        print(f"Tjek: {len(top_deals)} store kupp på tvers av alle aviser")
-        sources.append("tilbudsavisene (Tjek)")
-    except Exception as ex:
-        print(f"Tjek feilet: {ex}")
-        errors.append(f"tilbudsavisene kunne ikke hentes ({ex})")
+    shelf = {it: [] for it in items}
 
-    # 2) Prisfall fra Kassalapp (valgfritt)
+    # 1) Hyllepriser og prisfall fra Kassalapp (valgfritt, men gir ekte referansepris)
     if key:
         today = NOW.date().isoformat()
         for i, item in enumerate(items):
@@ -666,6 +769,9 @@ def main():
                 if not o or not store_ok(o["store"], store_filter):
                     continue
                 offers.append(o)
+                se = shelf_entry(p)
+                if se:
+                    shelf[item].append(se)
                 h = history.setdefault(o["id"], [])
                 if not h or h[-1][0] != today:
                     h.append([today, o["price"]])
@@ -673,9 +779,42 @@ def main():
             results[item]["deals"] = sorted((o for o in offers if o["verdict"]), key=lambda o: -o["discount"])[:MAX_DEALS]
             with_unit = [o for o in offers if o["unit_price"]]
             results[item]["cheapest"] = min(with_unit, key=lambda o: o["unit_price"]) if with_unit else None
+            print(f"  {len(shelf[item])} hyllepriser")
         sources.append("Kassalapp")
     else:
-        print("Ingen KASSALAPP_API_KEY: hopper over prisfall.")
+        print("Ingen KASSALAPP_API_KEY: bruker bare avisene som sammenligning.")
+
+    # 2) Tilbudsavisene fra Tjek
+    geo = read_place()
+    try:
+        all_avis, store_by_catalog = tjek_all_offers(geo, store_filter)
+        print(f"Tjek: {len(all_avis)} tilbud totalt")
+        for item in items:
+            found = {o["id"]: o for o in all_avis if matches(item, o["name"])}
+            time.sleep(TJEK_PAUSE)
+            try:
+                for o in tjek_search(geo, split_item(item)[0], store_by_catalog, store_filter):
+                    if matches(item, o["name"]):
+                        found.setdefault(o["id"], o)
+            except Exception as ex:
+                print(f"  søk feilet for {item}: {ex}")
+            judged, cycle = judge_item(item, list(found.values()), history, week_key, shelf[item])
+            results[item]["avis"] = sorted(judged, key=sort_key)[:MAX_AVIS]
+            results[item]["cycle"] = cycle
+            n_shelf = sum(1 for o in judged if o.get("shelf_disc") is not None)
+            print(f"  {item}: {len(found)} avistilbud, {n_shelf} med hyllepris")
+        seen = set()
+        for o in sorted((o for o in all_avis if o["verdict"] == "kupp" and o["discount"] is not None), key=lambda o: -o["discount"]):
+            k = (o["store"], o["name"].lower(), o["price"])
+            if k not in seen:
+                seen.add(k)
+                top_deals.append(o)
+        top_deals = top_deals[:TOP_DEALS]
+        print(f"Tjek: {len(top_deals)} store kupp på tvers av alle aviser")
+        sources.append("tilbudsavisene (Tjek)")
+    except Exception as ex:
+        print(f"Tjek feilet: {ex}")
+        errors.append(f"tilbudsavisene kunne ikke hentes ({ex})")
 
     if not sources:
         sys.exit("Ingen kilder svarte. Se loggen over.")

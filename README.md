@@ -4,7 +4,7 @@ Henter ukas tilbudsaviser og prisfall for handlelista di to ganger i uka (mandag
 
 **Kilder**
 - **Tilbudsavisene** (Tjek, dataene bak Mattilbud/eTilbudsavis): ukas avistilbud fra Kiwi, Rema 1000, Extra og de andre kjedene i nærheten, med førpris når kjeden oppgir den. Dette er et uoffisielt API uten dokumentasjon, så det kan endre seg eller slutte å virke. Ment for privat bruk.
-- **Kassalapp** (valgfritt): prisfall målt mot vanlig pris de siste 120 dagene, og billigste alternativ per kg/l.
+- **Kassalapp** (sterkt anbefalt): vanlig hyllepris, som avistilbudene sammenlignes med. Uten nøkkel sammenlignes tilbudene bare med hverandre.
 
 ## Oppsett (ca. 10 minutter)
 
@@ -19,6 +19,7 @@ Legg siden til på hjemskjermen på mobilen, så fungerer den som en app.
 ## Daglig bruk
 
 - `handleliste.txt`: én vare per linje. Alle ordene må finnes i varenavnet, så «kaffe» treffer «Evergood kaffe», mens «melk» også treffer «sjokomelk».
+- Skriv `(lager)` bak varer som tåler å lagres, for eksempel `kaffe (lager)` eller `pasta (lager)`. Da får du råd om å hamstre på bunnpris, og etter hvert «vent, neste kupp ventes om ca. 2 uker».
 - `butikker.txt`: kjedene som tas med.
 - `sted.txt`: hvor du handler.
 

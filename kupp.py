@@ -148,19 +148,40 @@ def tjek_unit(price, q):
     return price / amount, ("stk" if sym == "pcs" else sym)
 
 
-PRE_RE = re.compile(r"(?:før|ordinær|ord\.|veil\.)\s*(?:pris)?\s*:?\s*(?:kr\.?\s*)?(\d{1,4}(?:[.,]\d{1,2})?)", re.I)
+PRE_RE = re.compile(
+    r"(?:før|ordinær|ord\.|veil\.)\s*(?:pris)?\s*:?\s*(?:kr\.?\s*)?(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:,-)?\s*"
+    r"((?:pr\.?|per|/)\s*(?:kg|kilo|l\b|liter))?", re.I)
+UNIT_RE = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:,-)?\s*(?:pr\.?|per|/)\s*(kg|kilo|l\b|liter)", re.I)
 
 
-def pre_from_text(text, price):
-    """Mange kjeder skriver «Før 189,90» i teksten i stedet for i førpris-feltet."""
+def pre_from_text(text):
+    """Mange kjeder skriver «Før 189,90» eller «Før 159,- pr kg» i teksten i stedet for i førpris-feltet.
+    Gir (pris, per_enhet) der per_enhet er "kg"/"l" eller None."""
+    out = []
     for m in PRE_RE.finditer(text or ""):
         try:
             val = float(m.group(1).replace(",", "."))
         except ValueError:
             continue
-        if price < val < price * 4:
-            return val
-    return None
+        unit = None
+        if m.group(2):
+            unit = "l" if re.search(r"l\b|liter", m.group(2), re.I) else "kg"
+        out.append((val, unit))
+    return out
+
+
+def unit_from_text(text):
+    """Kilo-/literpris skrevet i teksten, f.eks. «Kr 179,80 pr kg»."""
+    for m in UNIT_RE.finditer(text or ""):
+        before = (text or "")[max(0, m.start() - 12):m.start()].lower()
+        if "før" in before or "ord" in before or "veil" in before:
+            continue
+        try:
+            val = float(m.group(1).replace(",", "."))
+        except ValueError:
+            continue
+        return val, ("l" if m.group(2).lower().startswith("l") else "kg")
+    return None, None
 
 
 def norm_tjek(o, store_by_catalog):
@@ -172,26 +193,46 @@ def norm_tjek(o, store_by_catalog):
     start = parse_date(o.get("run_from"))
     if till and till < NOW:
         return None
-    pre = pricing.get("pre_price") or pre_from_text(o.get("description"), price)
-    discount = (1 - price / pre) if pre and pre > price else None
+    text = f'{o.get("heading") or ""} {o.get("description") or ""}'
+    unit_price, unit = tjek_unit(price, o.get("quantity"))
+    if unit_price is None:
+        unit_price, unit = unit_from_text(text)
+    pre, pre_unit, discount = pricing.get("pre_price"), None, None
+    if pre and pre > price:
+        discount = 1 - price / pre
+    else:
+        pre = None
+        for val, per in pre_from_text(text):
+            if per:
+                # Førpris per kg/l: sammenlign med kilo-/literprisen, ikke pakkeprisen.
+                cmp = unit_price if unit == per else (price if unit_price is None else None)
+                if cmp and cmp < val < cmp * 4:
+                    pre, pre_unit, discount = val, per, 1 - cmp / val
+                    if unit_price is None:
+                        unit_price, unit = price, per
+                    break
+            elif price < val < price * 4:
+                pre, discount = val, 1 - price / val
+                break
     if discount is not None and discount >= KUPP:
         verdict = "kupp"
     elif discount is not None and discount >= GREI:
         verdict = "grei"
     else:
         verdict = "avis"
-    unit_price, unit = tjek_unit(price, o.get("quantity"))
     return {
         "id": "tjek:" + str(o.get("id")),
         "name": (o.get("heading") or "").strip() or "Ukjent vare",
         "store": brand_name(o) or store_by_catalog.get(o.get("catalog_id")) or "Ukjent butikk",
         "price": float(price),
         "typical": float(pre) if pre else None,
+        "typical_unit": pre_unit,
         "discount": discount,
         "verdict": verdict,
         "unit_price": unit_price,
         "unit": unit or "stk",
         "url": None,
+        "image": (o.get("images") or {}).get("view") or (o.get("images") or {}).get("thumb"),
         "from": start,
         "till": till,
         "source": "avis",
@@ -310,6 +351,7 @@ def evaluate(product, history):
         "unit_price": product.get("current_unit_price"),
         "unit": unit_label(product),
         "url": product.get("url"),
+        "image": product.get("image"),
         "from": None,
         "till": None,
         "source": "kassalapp",
@@ -341,7 +383,8 @@ def offer_html(o, small=False):
              "avis": '<span class="v v-avis">Avistilbud</span>'}.get(o["verdict"], "")
     if o["discount"] is not None and o["typical"]:
         ref = "førpris" if o["source"] == "avis" else "vanlig pris"
-        why = f"{round(o['discount'] * 100)} % under {ref} ({kr(o['typical'])})"
+        per = f"/{o['typical_unit']}" if o.get("typical_unit") else ""
+        why = f"{round(o['discount'] * 100)} % under {ref} ({kr(o['typical'])}{per})"
     elif o["source"] == "avis":
         why = "Kjeden oppgir ingen førpris"
     else:
@@ -355,8 +398,9 @@ def offer_html(o, small=False):
         meta.append(f"fra {short_date(o['from'])}")
     if o["till"]:
         meta.append(f"til {short_date(o['till'])}")
+    img = f'<img class="pic" src="{e(o["image"])}" alt="" loading="lazy" referrerpolicy="no-referrer">' if o.get("image") else ""
     return (f'<div class="offer{" small" if small else ""}"><div class="price"><b>{kr(o["price"])}</b>{unit}</div>'
-            f'<div class="info"><p class="prod">{name}</p><p class="meta">{", ".join(meta)}</p>'
+            f'<div class="info">{img}<p class="prod">{name}</p><p class="meta">{", ".join(meta)}</p>'
             f'<p class="why">{badge}{e(why)}</p></div></div>')
 
 
@@ -375,7 +419,9 @@ h2{font-stretch:75%;font-weight:800;font-size:1.4rem;margin:0 0 10px}
 .price{background:var(--tag);color:var(--tag-ink);padding:10px 14px;display:flex;flex-direction:column;justify-content:center;min-width:112px}
 .price b{font-stretch:62%;font-weight:900;font-size:2.1rem;line-height:.95}.price small{font-size:.75rem;font-weight:600;opacity:.8;margin-top:3px}
 .small .price b{font-size:1.6rem}.small .price{min-width:92px}
-.info{padding:10px 12px;min-width:0}.prod{font-weight:700;margin:0;overflow-wrap:anywhere}.prod a{color:inherit}
+.info{padding:10px 12px;min-width:0;overflow:hidden}
+.pic{float:right;width:72px;height:72px;object-fit:contain;background:#fff;border-radius:4px;margin:0 0 6px 10px}
+.small .pic{width:56px;height:56px}.prod{font-weight:700;margin:0;overflow-wrap:anywhere}.prod a{color:inherit}
 .meta{color:var(--muted);font-size:.88rem;margin:2px 0 0}.why{font-size:.9rem;margin:6px 0 0}
 .v{display:inline-block;font-size:.78rem;font-weight:800;padding:2px 8px;border-radius:3px;margin-right:6px}
 .v-kupp{background:var(--red);color:#fff}.v-grei{background:var(--chip);color:var(--ink)}.v-avis{background:transparent;color:var(--ink);border:1px solid var(--line)}

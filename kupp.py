@@ -8,6 +8,7 @@ Kjør lokalt:  python kupp.py            (bare tilbudsaviser)
 """
 import html
 import json
+import re
 import os
 import statistics
 import sys
@@ -36,6 +37,7 @@ HIST_KEEP = 40       # egne prispunkter lagret per produkt
 PAUSE = 1.1          # sekunder mellom API-kall
 TJEK_PAUSE = 0.8     # sekunder mellom kall til Tjek (vær høflig)
 MAX_AVIS = 5         # avistilbud vist per vare
+TOP_DEALS = 15       # «ukas største kupp» uansett handleliste
 
 NOW = datetime.now(timezone.utc)
 
@@ -146,6 +148,21 @@ def tjek_unit(price, q):
     return price / amount, ("stk" if sym == "pcs" else sym)
 
 
+PRE_RE = re.compile(r"(?:før|ordinær|ord\.|veil\.)\s*(?:pris)?\s*:?\s*(?:kr\.?\s*)?(\d{1,4}(?:[.,]\d{1,2})?)", re.I)
+
+
+def pre_from_text(text, price):
+    """Mange kjeder skriver «Før 189,90» i teksten i stedet for i førpris-feltet."""
+    for m in PRE_RE.finditer(text or ""):
+        try:
+            val = float(m.group(1).replace(",", "."))
+        except ValueError:
+            continue
+        if price < val < price * 4:
+            return val
+    return None
+
+
 def norm_tjek(o, store_by_catalog):
     pricing = o.get("pricing") or {}
     price = pricing.get("price")
@@ -155,8 +172,8 @@ def norm_tjek(o, store_by_catalog):
     start = parse_date(o.get("run_from"))
     if till and till < NOW:
         return None
-    pre = pricing.get("pre_price")
-    discount = (1 - price / pre) if pre else None
+    pre = pricing.get("pre_price") or pre_from_text(o.get("description"), price)
+    discount = (1 - price / pre) if pre and pre > price else None
     if discount is not None and discount >= KUPP:
         verdict = "kupp"
     elif discount is not None and discount >= GREI:
@@ -181,8 +198,14 @@ def norm_tjek(o, store_by_catalog):
     }
 
 
+NOT_GROCERY = ("bygg", "flis", "jernia", "europris", "clas ohlson", "biltema", "xxl")
+
+
 def store_ok(name, store_filter):
-    return not store_filter or any(s in (name or "").lower() for s in store_filter)
+    n = (name or "").lower()
+    if any(x in n for x in NOT_GROCERY):
+        return False
+    return not store_filter or any(re.search(r"(?<!\w)" + re.escape(s) + r"(?!\w)", n) for s in store_filter)
 
 
 def tjek_all_offers(geo, store_filter):
@@ -216,10 +239,18 @@ def tjek_search(geo, term, store_by_catalog, store_filter):
     return [o for o in out if store_ok(o["store"], store_filter)]
 
 
+def split_item(line):
+    """«brød -knekkebrød -mix» -> visningsnavn «brød», søkeord og ord som utelukker."""
+    words = line.lower().split()
+    plus = [w for w in words if not w.startswith("-")]
+    minus = [w[1:] for w in words if w.startswith("-") and len(w) > 1]
+    return " ".join(plus) or line, plus, minus
+
+
 def matches(item, name):
-    words = item.lower().split()
+    _, plus, minus = split_item(item)
     n = name.lower()
-    return all(w in n for w in words)
+    return all(w in n for w in plus) and not any(w in n for w in minus)
 
 
 # ---------- vurdering ----------
@@ -359,7 +390,7 @@ def sort_key(o):
     return (rank, -(o["discount"] or 0), o["unit_price"] if o["unit_price"] else o["price"])
 
 
-def build_html(results, week, errors, sources):
+def build_html(results, week, errors, sources, top_deals):
     e = html.escape
     n_avis = sum(1 for r in results.values() if r["avis"])
     n_kupp = sum(1 for r in results.values() for o in r["avis"] + r["deals"] if o["verdict"] == "kupp")
@@ -377,7 +408,7 @@ def build_html(results, week, errors, sources):
 
     parts = []
     for item, r in results.items():
-        parts.append(f"<section><h2>{e(item)}</h2>")
+        parts.append(f"<section><h2>{e(split_item(item)[0])}</h2>")
         if r["avis"]:
             parts.append("<h3>I tilbudsavisene</h3>")
             parts.append(offer_html(r["avis"][0]))
@@ -392,6 +423,10 @@ def build_html(results, week, errors, sources):
             per = f" ({kr(c['unit_price'])}/{c['unit']})" if c["unit_price"] else ""
             parts.append(f'<p class="cheap">Billigst per {c["unit"]} uten tilbud: {e(c["name"])}, '
                          f'{e(c["store"])}, {kr(c["price"])}{per}</p>')
+        parts.append("</section>")
+    if top_deals:
+        parts.append('<section><h2>Ukas største kupp</h2><p class="cheap">Uansett handleliste, sortert etter rabatt mot førpris.</p>')
+        parts.extend(offer_html(o, small=True) for o in top_deals)
         parts.append("</section>")
     if errors:
         parts.append(f'<p class="none">Feil underveis: {e("; ".join(errors))}.</p>')
@@ -423,6 +458,7 @@ def main():
     history = json.loads(HIST_FILE.read_text(encoding="utf-8")) if HIST_FILE.exists() else {}
     errors, sources = [], []
     results = {it: {"avis": [], "deals": [], "cheapest": None} for it in items}
+    top_deals = []
 
     # 1) Tilbudsavisene fra Tjek
     geo = read_place()
@@ -433,13 +469,21 @@ def main():
             found = {o["id"]: o for o in all_avis if matches(item, o["name"])}
             time.sleep(TJEK_PAUSE)
             try:
-                for o in tjek_search(geo, item, store_by_catalog, store_filter):
+                for o in tjek_search(geo, split_item(item)[0], store_by_catalog, store_filter):
                     if matches(item, o["name"]):
                         found.setdefault(o["id"], o)
             except Exception as ex:
                 print(f"  søk feilet for {item}: {ex}")
             results[item]["avis"] = sorted(found.values(), key=sort_key)[:MAX_AVIS]
             print(f"  {item}: {len(found)} avistilbud")
+        seen = set()
+        for o in sorted((o for o in all_avis if o["verdict"] == "kupp"), key=lambda o: -o["discount"]):
+            k = (o["store"], o["name"].lower(), o["price"])
+            if k not in seen:
+                seen.add(k)
+                top_deals.append(o)
+        top_deals = top_deals[:TOP_DEALS]
+        print(f"Tjek: {len(top_deals)} store kupp på tvers av alle aviser")
         sources.append("tilbudsavisene (Tjek)")
     except Exception as ex:
         print(f"Tjek feilet: {ex}")
@@ -453,7 +497,7 @@ def main():
                 time.sleep(PAUSE)
             print(f"Kassalapp: {item}")
             try:
-                products = search(key, item)
+                products = [p for p in search(key, split_item(item)[0]) if matches(item, p.get("name") or "")]
             except Exception as ex:
                 print(f"  feil: {ex}")
                 errors.append(f"Kassalapp: {item}")
@@ -480,7 +524,7 @@ def main():
 
     week = NOW.isocalendar()[1]
     OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    OUT_FILE.write_text(build_html(results, week, errors, sources), encoding="utf-8")
+    OUT_FILE.write_text(build_html(results, week, errors, sources, top_deals), encoding="utf-8")
     HIST_FILE.parent.mkdir(parents=True, exist_ok=True)
     HIST_FILE.write_text(json.dumps(history, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     print(f"Skrev {OUT_FILE.relative_to(ROOT)}")
